@@ -22,6 +22,7 @@ from streaming.base.util import get_import_exception_message, retry
 __all__ = [
     'CloudUploader',
     'S3Uploader',
+    'SFTPUploader',
     'GCSUploader',
     'OCIUploader',
     'AzureUploader',
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 UPLOADERS = {
     's3': 'S3Uploader',
+    'sftp': 'SFTPUploader',
     'gs': 'GCSUploader',
     'oci': 'OCIUploader',
     'azure': 'AzureUploader',
@@ -325,6 +327,97 @@ class S3Uploader(CloudUploader):
         pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
         try:
             return [obj['Key'] for page in pages for obj in page['Contents']]
+        except KeyError:
+            return []
+
+class SFTPUploader(CloudUploader):
+    def __init__(self, 
+                 out: str | Tuple[str, str], 
+                 keep_local: bool = False, 
+                 progress_bar: bool = False, 
+                 retry: int = 2, 
+                 exist_ok: bool = False) -> None:
+        super().__init__(out, keep_local, progress_bar, retry, exist_ok)
+        from paramiko import SSHClient
+
+        # Parse URL
+        url = urllib.parse.urlsplit(self.remote)
+        if url.scheme.lower() != 'sftp':
+            raise ValueError('If specifying a URI, only the sftp scheme is supported.')
+        if not url.hostname:
+            raise ValueError('If specifying a URI, the URI must include the hostname.')
+        if url.query or url.fragment:
+            raise ValueError('Query and fragment parameters are not supported as part of a URI.')
+        hostname = url.hostname
+        port = url.port
+        username = url.username
+        password = url.password
+        self.remote_path = url.path
+
+
+        # Get SSH key file if specified
+        key_filename = os.environ.get('COMPOSER_SFTP_KEY_FILE', None)
+        known_hosts_filename = os.environ.get('COMPOSER_SFTP_KNOWN_HOSTS_FILE', None)
+
+        # Default port
+        port = port if port else 22
+
+        self.ssh_client = SSHClient()
+        # Connect SSH Client
+        self.ssh_client.load_system_host_keys(known_hosts_filename)
+        self.ssh_client.connect(
+            hostname=hostname,
+            port=port,
+            username=username,
+            password=password,
+            key_filename=key_filename,
+        )
+        print("SSH connection to {} established.".format(hostname))
+
+        # SFTP Client
+        self.sftp_client = self.ssh_client.open_sftp()
+
+        print("SFTP connection established.")
+
+    def __del__(self) -> None:
+        self.sftp_client.close()
+        print("SFTP connection closed.")
+
+        self.ssh_client.close()
+        print("SSH connection closed.")
+
+
+    def upload_file(self, filename: str):
+        @retry(num_attempts=self.retry)
+        def _upload_file():
+            local_filename = os.path.join(self.local, filename)
+            remote_filename = os.path.join(self.remote, filename)
+
+            logger.debug(f'Uploading to {remote_filename}')
+            file_size = os.stat(local_filename).st_size
+
+            with tqdm.tqdm(total=file_size,
+                    unit='B',
+                    unit_scale=True,
+                    desc=f'Uploading to {remote_filename}',
+                    disable=(not self.progress_bar)) as pbar:
+                        self.sftp_client.put(localpath=local_filename, remotepath=remote_filename)
+            self.clear_local(local=local_filename)
+        
+        _upload_file()
+
+    def list_objects(self, prefix: str | None = None) -> List[str] | None:
+        # List objects at the remote path
+        if prefix is None:
+            prefix = ''
+
+        obj = urllib.parse.urlparse(self.remote)
+        prefix = os.path.join(str(obj.path).lstrip('/'), prefix)
+
+        objects = self.sftp_client.listdir(self.remote)
+
+        try:
+            return [_object for _object in objects if _object.startswith(prefix)]
         except KeyError:
             return []
 
